@@ -7,13 +7,15 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import re
 import os
-import io
+import threading
+from flask import Flask, request, jsonify
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # ========== 配置 ==========
 TOKEN = "8764596414:AAGvTV2fU0MQiB6R87UxOPSiYjUXi1Ps2OY"
 MASTER_USER_ID = 8782394486
+PORT = int(os.environ.get('PORT', 8080))
 
 TIMEZONES = {
     'china': 'Asia/Shanghai',
@@ -22,7 +24,11 @@ TIMEZONES = {
     'vietnam': 'Asia/Ho_Chi_Minh',
     'singapore': 'Asia/Singapore',
 }
-# =========================
+
+# Flask Web 应用
+flask_app = Flask(__name__)
+
+# ========== 数据库函数 ==========
 
 def get_current_time(timezone_str):
     try:
@@ -129,13 +135,22 @@ def get_bills_by_date(group_id, date_str):
     conn.close()
     return bills, total_income, total_expense
 
-def get_all_dates(group_id):
+def get_today_bills(group_id):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    c.execute("SELECT DISTINCT date(timestamp) FROM bills WHERE group_id = ? ORDER BY date(timestamp) DESC", (group_id,))
-    dates = [row[0] for row in c.fetchall()]
+    tz_str = get_setting(group_id, 'timezone') or 'Asia/Yangon'
+    now, _, _ = get_current_time(tz_str)
+    today_date = now.strftime("%Y-%m-%d")
+    c.execute("SELECT remark, username, amount, usdt_amount, exchange_rate, timestamp FROM bills WHERE group_id = ? AND bill_type = 'income' AND date(timestamp) = ? ORDER BY id DESC", (group_id, today_date))
+    income = c.fetchall()
+    c.execute("SELECT remark, username, usdt_amount, exchange_rate, timestamp FROM bills WHERE group_id = ? AND bill_type = 'expense' AND date(timestamp) = ? ORDER BY id DESC", (group_id, today_date))
+    expense = c.fetchall()
+    c.execute("SELECT SUM(amount), SUM(usdt_amount) FROM bills WHERE group_id = ? AND bill_type = 'income' AND date(timestamp) = ?", (group_id, today_date))
+    total_income = c.fetchone()
+    c.execute("SELECT SUM(usdt_amount) FROM bills WHERE group_id = ? AND bill_type = 'expense' AND date(timestamp) = ?", (group_id, today_date))
+    total_expense = c.fetchone()
     conn.close()
-    return dates
+    return income, expense, total_income, total_expense, today_date
 
 def delete_today_bills(group_id):
     tz_str = get_setting(group_id, 'timezone') or 'Asia/Yangon'
@@ -181,380 +196,376 @@ def delete_user_bills(group_id, name):
     conn.close()
     return deleted
 
-def get_today_bills(group_id):
-    """获取今天的账单"""
-    conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    tz_str = get_setting(group_id, 'timezone') or 'Asia/Yangon'
-    now, _, _ = get_current_time(tz_str)
-    today_date = now.strftime("%Y-%m-%d")
+# ========== Web API ==========
+
+@flask_app.route('/')
+def index():
+    """返回首页"""
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>记账账单</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                background: #f0f2f5;
+                padding: 20px;
+            }
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 16px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+                overflow: hidden;
+            }
+            .header {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 24px 30px;
+            }
+            .header h1 { font-size: 28px; margin-bottom: 8px; }
+            .header p { opacity: 0.9; font-size: 14px; }
+            .date-nav {
+                background: white;
+                padding: 15px 20px;
+                border-bottom: 1px solid #e0e0e0;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            .date-nav button {
+                background: #667eea;
+                color: white;
+                border: none;
+                padding: 8px 20px;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 14px;
+            }
+            .date-nav button:hover { background: #5a67d8; }
+            .date-picker {
+                display: flex;
+                gap: 10px;
+                align-items: center;
+            }
+            .date-picker input {
+                padding: 8px 12px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                font-size: 14px;
+            }
+            .content { padding: 24px 30px; }
+            .section { margin-bottom: 32px; }
+            .section-title {
+                font-size: 18px;
+                font-weight: 600;
+                margin-bottom: 16px;
+                padding-bottom: 8px;
+                border-bottom: 2px solid #667eea;
+                color: #333;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 14px;
+            }
+            th, td {
+                padding: 12px 10px;
+                text-align: left;
+                border-bottom: 1px solid #eef2f6;
+            }
+            th {
+                background: #f8f9fc;
+                font-weight: 600;
+                color: #4a5568;
+            }
+            .stats-box {
+                background: linear-gradient(135deg, #f8f9fc 0%, #f0f2f5 100%);
+                border-radius: 12px;
+                padding: 24px;
+                margin-top: 20px;
+            }
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 16px;
+            }
+            .stat-card {
+                background: white;
+                padding: 16px;
+                border-radius: 12px;
+                text-align: center;
+            }
+            .stat-label { font-size: 12px; color: #888; margin-bottom: 8px; }
+            .stat-value { font-size: 24px; font-weight: 700; color: #333; }
+            .category-list {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 12px;
+                margin-top: 12px;
+            }
+            .category-item {
+                background: #e8f4f8;
+                padding: 8px 16px;
+                border-radius: 20px;
+                font-size: 13px;
+            }
+            .loading { text-align: center; padding: 50px; font-size: 18px; color: #888; }
+            .error { text-align: center; padding: 50px; color: red; }
+            .footer {
+                background: #f8f9fc;
+                padding: 16px 30px;
+                text-align: center;
+                font-size: 12px;
+                color: #888;
+            }
+            @media (max-width: 768px) {
+                body { padding: 10px; }
+                .content { padding: 16px; }
+                th, td { padding: 8px 4px; font-size: 11px; }
+                .stat-value { font-size: 16px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>📋 记账账单</h1>
+                <p id="dateInfo">加载中...</p>
+            </div>
+            <div class="date-nav">
+                <div class="date-picker">
+                    <label>📅 选择日期：</label>
+                    <input type="date" id="datePicker" onchange="loadData()">
+                    <button onclick="loadData()">跳转</button>
+                </div>
+                <div class="date-picker">
+                    <button onclick="prevDay()">◀ 前一天</button>
+                    <button onclick="nextDay()">后一天 ▶</button>
+                </div>
+            </div>
+            <div class="content" id="content">
+                <div class="loading">加载中...</div>
+            </div>
+            <div class="footer">
+                <p>💡 选择日期查看任意一天的账单</p>
+            </div>
+        </div>
+
+        <script>
+            let currentDate = new Date().toISOString().split('T')[0];
+            
+            function getDateFromURL() {
+                const urlParams = new URLSearchParams(window.location.search);
+                const date = urlParams.get('date');
+                if (date) {
+                    currentDate = date;
+                    document.getElementById('datePicker').value = date;
+                } else {
+                    document.getElementById('datePicker').value = currentDate;
+                }
+            }
+            
+            async function loadData() {
+                const datePicker = document.getElementById('datePicker');
+                currentDate = datePicker.value;
+                updateURL();
+                
+                document.getElementById('dateInfo').innerHTML = `📅 ${currentDate} | 时差对照：UTC+8 北京时间`;
+                document.getElementById('content').innerHTML = '<div class="loading">加载中...</div>';
+                
+                try {
+                    const response = await fetch(`/api/bill?date=${currentDate}&group_id=0`);
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        document.getElementById('content').innerHTML = `<div class="error">❌ ${data.error}</div>`;
+                        return;
+                    }
+                    
+                    renderHTML(data);
+                } catch (err) {
+                    document.getElementById('content').innerHTML = `<div class="error">❌ 加载失败：${err.message}</div>`;
+                }
+            }
+            
+            function renderHTML(data) {
+                let html = '';
+                
+                if (data.income_bills && data.income_bills.length > 0) {
+                    html += `<div class="section"><div class="section-title">📥 入款记录 (${data.income_bills.length} 笔)</div>`;
+                    html += `<table><thead><tr><th>备注</th><th>时间</th><th>金额(元)</th><th>汇率</th><th>USDT</th><th>操作人</th></tr></thead><tbody>`;
+                    for (const bill of data.income_bills) {
+                        html += `<tr>
+                            <td>${bill.remark || '-'}</td>
+                            <td>${bill.time}</td>
+                            <td>${bill.amount}</td>
+                            <td>${bill.exchange_rate}</td>
+                            <td>${bill.usdt}</td>
+                            <td>${bill.username}</td>
+                        </tr>`;
+                    }
+                    html += `</tbody></table></div>`;
+                } else {
+                    html += `<div class="section"><div class="section-title">📥 入款记录</div><div class="loading">暂无入款记录</div></div>`;
+                }
+                
+                if (data.expense_bills && data.expense_bills.length > 0) {
+                    html += `<div class="section"><div class="section-title">📤 下发记录 (${data.expense_bills.length} 笔)</div>`;
+                    html += `<table><thead><tr><th>备注</th><th>时间</th><th>USDT</th><th>操作人</th></tr></thead><tbody>`;
+                    for (const bill of data.expense_bills) {
+                        html += `<tr>
+                            <td>${bill.remark || '-'}</td>
+                            <td>${bill.time}</td>
+                            <td>${bill.usdt}</td>
+                            <td>${bill.username}</td>
+                        </tr>`;
+                    }
+                    html += `</tbody></table></div>`;
+                }
+                
+                if (data.remark_stats && data.remark_stats.length > 0) {
+                    html += `<div class="section"><div class="section-title">📊 入款备注分类</div><div class="category-list">`;
+                    for (const stat of data.remark_stats) {
+                        html += `<div class="category-item">📝 ${stat.remark || '无备注'}: ${stat.count}笔, ${stat.amount}元, ${stat.usdt}U</div>`;
+                    }
+                    html += `</div></div>`;
+                }
+                
+                html += `<div class="stats-box"><div class="stats-grid">
+                    <div class="stat-card"><div class="stat-label">💰 费率</div><div class="stat-value">${data.fee_rate}<span class="stat-unit">%</span></div></div>
+                    <div class="stat-card"><div class="stat-label">💱 汇率</div><div class="stat-value">${data.exchange_rate}<span class="stat-unit"></span></div></div>
+                    <div class="stat-card"><div class="stat-label">📥 总入款(元)</div><div class="stat-value">${data.total_rmb}<span class="stat-unit"></span></div></div>
+                    <div class="stat-card"><div class="stat-label">💵 总入款(USDT)</div><div class="stat-value">${data.total_usdt}<span class="stat-unit">U</span></div></div>
+                    <div class="stat-card"><div class="stat-label">📤 已下发</div><div class="stat-value">${data.expense_usdt}<span class="stat-unit">U</span></div></div>
+                    <div class="stat-card"><div class="stat-label">📊 未下发</div><div class="stat-value">${data.remaining_usdt}<span class="stat-unit">U</span></div></div>
+                </div></div>`;
+                
+                document.getElementById('content').innerHTML = html;
+            }
+            
+            function updateURL() {
+                const url = new URL(window.location.href);
+                url.searchParams.set('date', currentDate);
+                window.history.pushState({}, '', url);
+            }
+            
+            function prevDay() {
+                const d = new Date(currentDate);
+                d.setDate(d.getDate() - 1);
+                currentDate = d.toISOString().split('T')[0];
+                document.getElementById('datePicker').value = currentDate;
+                loadData();
+            }
+            
+            function nextDay() {
+                const d = new Date(currentDate);
+                d.setDate(d.getDate() + 1);
+                currentDate = d.toISOString().split('T')[0];
+                document.getElementById('datePicker').value = currentDate;
+                loadData();
+            }
+            
+            getDateFromURL();
+            loadData();
+        </script>
+    </body>
+    </html>
+    '''
+
+@flask_app.route('/api/bill')
+def api_bill():
+    """API: 获取账单数据"""
+    date_str = request.args.get('date')
+    group_id = request.args.get('group_id', type=int, default=0)
     
-    # 入款
-    c.execute("SELECT remark, username, amount, usdt_amount, exchange_rate, timestamp FROM bills WHERE group_id = ? AND bill_type = 'income' AND date(timestamp) = ? ORDER BY id DESC", (group_id, today_date))
-    income = c.fetchall()
-    # 下发
-    c.execute("SELECT remark, username, usdt_amount, exchange_rate, timestamp FROM bills WHERE group_id = ? AND bill_type = 'expense' AND date(timestamp) = ? ORDER BY id DESC", (group_id, today_date))
-    expense = c.fetchall()
-    # 总计
-    c.execute("SELECT SUM(amount), SUM(usdt_amount) FROM bills WHERE group_id = ? AND bill_type = 'income' AND date(timestamp) = ?", (group_id, today_date))
-    total_income = c.fetchone()
-    c.execute("SELECT SUM(usdt_amount) FROM bills WHERE group_id = ? AND bill_type = 'expense' AND date(timestamp) = ?", (group_id, today_date))
-    total_expense = c.fetchone()
-    conn.close()
-    return income, expense, total_income, total_expense, today_date
-
-# ========== 生成 HTML 账单 ==========
-
-def generate_html_bill(gid, date_str):
-    """生成指定日期的 HTML 账单"""
-    bills, total_income, total_expense = get_bills_by_date(gid, date_str)
-    rate = get_setting(gid, 'exchange_rate') or 7.2
-    fee_rate = get_setting(gid, 'fee_rate') or 0
-    show_usdt = get_setting(gid, 'show_usdt') or 1
+    if not date_str:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    
+    bills, total_income, total_expense = get_bills_by_date(group_id, date_str)
+    
+    rate = get_setting(group_id, 'exchange_rate') or 7.2
+    fee_rate = get_setting(group_id, 'fee_rate') or 0
     
     total_rmb = total_income[0] or 0
     total_usdt = total_income[1] or 0
     expense_usdt = total_expense[0] or 0
     
-    income_bills = [b for b in bills if b[5] == 'income']
-    expense_bills = [b for b in bills if b[5] == 'expense']
-    
-    # 按备注分类
+    income_bills = []
+    expense_bills = []
     remark_stats = {}
-    for bill in income_bills:
-        remark = bill[0] if bill[0] else '无备注'
-        if remark not in remark_stats:
-            remark_stats[remark] = {'count': 0, 'amount': 0, 'usdt': 0}
-        remark_stats[remark]['count'] += 1
-        remark_stats[remark]['amount'] += bill[2]
-        remark_stats[remark]['usdt'] += bill[3]
     
-    today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    date_display = f"{date_str[5:7]}-{date_str[8:10]}" if len(date_str) > 8 else date_str
+    for bill in bills:
+        remark, username, amount, usdt, ex_rate, bill_type, ts = bill
+        time_str = ts[11:16] if len(ts) > 11 else ts
+        
+        if bill_type == 'income':
+            income_bills.append({
+                'remark': remark or '-',
+                'username': username,
+                'amount': f"{amount:.0f}",
+                'usdt': f"{usdt:.2f}",
+                'exchange_rate': f"{ex_rate:.2f}",
+                'time': time_str
+            })
+            key = remark if remark else '无备注'
+            if key not in remark_stats:
+                remark_stats[key] = {'count': 0, 'amount': 0, 'usdt': 0}
+            remark_stats[key]['count'] += 1
+            remark_stats[key]['amount'] += amount
+            remark_stats[key]['usdt'] += usdt
+        else:
+            expense_bills.append({
+                'remark': remark or '-',
+                'username': username,
+                'usdt': f"{usdt:.2f}",
+                'time': time_str
+            })
     
-    html = f'''<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>记账账单 {date_str}</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #f0f2f5;
-            padding: 20px;
-        }}
-        .container {{
-            max-width: 1400px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }}
-        .header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 24px 30px;
-        }}
-        .header h1 {{ font-size: 28px; margin-bottom: 8px; }}
-        .header p {{ opacity: 0.9; font-size: 14px; }}
-        .date-nav {{
-            background: white;
-            padding: 15px 20px;
-            border-bottom: 1px solid #e0e0e0;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-        }}
-        .date-nav button {{
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 8px 20px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 14px;
-            transition: background 0.3s;
-        }}
-        .date-nav button:hover {{ background: #5a67d8; }}
-        .date-nav .date-display {{
-            font-size: 20px;
-            font-weight: 600;
-            color: #333;
-        }}
-        .date-picker {{
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }}
-        .date-picker input {{
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
-        }}
-        .content {{ padding: 24px 30px; }}
-        .section {{ margin-bottom: 32px; }}
-        .section-title {{
-            font-size: 18px;
-            font-weight: 600;
-            margin-bottom: 16px;
-            padding-bottom: 8px;
-            border-bottom: 2px solid #667eea;
-            color: #333;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 14px;
-        }}
-        th, td {{
-            padding: 12px 10px;
-            text-align: left;
-            border-bottom: 1px solid #eef2f6;
-        }}
-        th {{
-            background: #f8f9fc;
-            font-weight: 600;
-            color: #4a5568;
-        }}
-        tr:hover {{ background: #f7fafc; }}
-        .stats-box {{
-            background: linear-gradient(135deg, #f8f9fc 0%, #f0f2f5 100%);
-            border-radius: 12px;
-            padding: 24px;
-            margin-top: 20px;
-        }}
-        .stats-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 16px;
-        }}
-        .stat-card {{
-            background: white;
-            padding: 16px;
-            border-radius: 12px;
-            text-align: center;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-        }}
-        .stat-label {{ font-size: 12px; color: #888; margin-bottom: 8px; }}
-        .stat-value {{ font-size: 24px; font-weight: 700; color: #333; }}
-        .stat-unit {{ font-size: 12px; color: #888; margin-left: 4px; }}
-        .category-list {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            margin-top: 12px;
-        }}
-        .category-item {{
-            background: #e8f4f8;
-            padding: 8px 16px;
-            border-radius: 20px;
-            font-size: 13px;
-            color: #2c5282;
-        }}
-        .no-data {{
-            text-align: center;
-            padding: 40px;
-            color: #888;
-        }}
-        .footer {{
-            background: #f8f9fc;
-            padding: 16px 30px;
-            text-align: center;
-            font-size: 12px;
-            color: #888;
-            border-top: 1px solid #e0e0e0;
-        }}
-        @media (max-width: 768px) {{
-            body {{ padding: 10px; }}
-            .content {{ padding: 16px; }}
-            th, td {{ padding: 8px 4px; font-size: 11px; }}
-            .stat-value {{ font-size: 16px; }}
-            .date-nav {{ flex-direction: column; }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>📋 记账账单</h1>
-            <p>📅 {date_str} | 时差对照：UTC+8 北京时间</p>
-        </div>
-        <div class="date-nav">
-            <div class="date-picker">
-                <label>📅 选择日期：</label>
-                <input type="date" id="datePicker" value="{date_str}" onchange="goToDate()">
-                <button onclick="goToDate()">跳转</button>
-            </div>
-            <div class="date-picker">
-                <button onclick="prevDay()">◀ 前一天</button>
-                <button onclick="nextDay()">后一天 ▶</button>
-            </div>
-        </div>
-        <div class="content">'''
+    remark_stats_list = [{'remark': k, 'count': v['count'], 'amount': f"{v['amount']:.0f}", 'usdt': f"{v['usdt']:.2f}"} 
+                         for k, v in remark_stats.items()]
     
-    if income_bills:
-        html += f'''
-            <div class="section">
-                <div class="section-title">📥 入款记录 ({len(income_bills)} 笔)</div>
-                <table>
-                    <thead><tr><th>备注</th><th>时间</th><th>金额(元)</th><th>汇率</th><th>USDT</th><th>操作人</th></tr></thead>
-                    <tbody>'''
-        for bill in income_bills:
-            remark, username, amount, usdt, ex_rate, _, ts = bill
-            time_str = ts[11:16] if len(ts) > 11 else ts
-            remark_text = remark if remark else '-'
-            html += f'<tr><td>{remark_text}</td><td>{time_str}</td><td>{amount:.0f}</td><td>{ex_rate:.2f}</td><td>{usdt:.2f}</td><td>{username}</td></tr>'
-        html += '</tbody></table></div>'
-    else:
-        html += '<div class="no-data">📭 今日暂无入款记录</div>'
-    
-    if expense_bills:
-        html += f'''
-            <div class="section">
-                <div class="section-title">📤 下发记录 ({len(expense_bills)} 笔)</div>
-                <table>
-                    <thead><tr><th>备注</th><th>时间</th><th>USDT</th><th>操作人</th></tr></thead>
-                    <tbody>'''
-        for bill in expense_bills:
-            remark, username, amount, usdt, ex_rate, _, ts = bill
-            time_str = ts[11:16] if len(ts) > 11 else ts
-            remark_text = remark if remark else '-'
-            html += f'<tr><td>{remark_text}</td><td>{time_str}</td><td>{usdt:.2f}</td><td>{username}</td></tr>'
-        html += '</tbody></table></div>'
-    
-    if remark_stats:
-        html += '<div class="section"><div class="section-title">📊 入款备注分类</div><div class="category-list">'
-        for remark, stats in remark_stats.items():
-            html += f'<div class="category-item">📝 {remark}: {stats["count"]}笔, {stats["amount"]:.0f}元, {stats["usdt"]:.2f}U</div>'
-        html += '</div></div>'
-    
-    html += f'''
-            <div class="stats-box">
-                <div class="stats-grid">
-                    <div class="stat-card"><div class="stat-label">💰 费率</div><div class="stat-value">{fee_rate:.0f}<span class="stat-unit">%</span></div></div>
-                    <div class="stat-card"><div class="stat-label">💱 汇率</div><div class="stat-value">{rate:.2f}<span class="stat-unit"></span></div></div>
-                    <div class="stat-card"><div class="stat-label">📥 总入款(元)</div><div class="stat-value">{total_rmb:.0f}<span class="stat-unit"></span></div></div>
-                    <div class="stat-card"><div class="stat-label">💵 总入款(USDT)</div><div class="stat-value">{total_usdt:.2f}<span class="stat-unit">U</span></div></div>
-                    <div class="stat-card"><div class="stat-label">📤 已下发</div><div class="stat-value">{expense_usdt:.2f}<span class="stat-unit">U</span></div></div>
-                    <div class="stat-card"><div class="stat-label">📊 未下发</div><div class="stat-value">{total_usdt - expense_usdt:.2f}<span class="stat-unit">U</span></div></div>
-                </div>
-            </div>
-        </div>
-        <div class="footer">
-            <p>📊 账单生成时间：{today}</p>
-            <p>💡 点击上方日历可以切换日期查看任意一天的账单</p>
-        </div>
-    </div>
-    <script>
-        const baseUrl = window.location.origin + window.location.pathname;
-        function goToDate() {{
-            const date = document.getElementById('datePicker').value;
-            if (date) {{
-                window.location.href = baseUrl + '?date=' + date;
-            }}
-        }}
-        function prevDay() {{
-            const date = document.getElementById('datePicker').value;
-            const d = new Date(date);
-            d.setDate(d.getDate() - 1);
-            window.location.href = baseUrl + '?date=' + d.toISOString().split('T')[0];
-        }}
-        function nextDay() {{
-            const date = document.getElementById('datePicker').value;
-            const d = new Date(date);
-            d.setDate(d.getDate() + 1);
-            window.location.href = baseUrl + '?date=' + d.toISOString().split('T')[0];
-        }}
-    </script>
-</body>
-</html>'''
-    
-    return html
+    return jsonify({
+        'date': date_str,
+        'exchange_rate': f"{rate:.2f}",
+        'fee_rate': f"{fee_rate:.0f}",
+        'total_rmb': f"{total_rmb:.0f}",
+        'total_usdt': f"{total_usdt:.2f}",
+        'expense_usdt': f"{expense_usdt:.2f}",
+        'remaining_usdt': f"{total_usdt - expense_usdt:.2f}",
+        'income_bills': income_bills,
+        'expense_bills': expense_bills,
+        'remark_stats': remark_stats_list
+    })
 
-# ========== 生成 HTML 文件并上传 ==========
-
-async def send_html_bill(update: Update, context: ContextTypes.DEFAULT_TYPE, date_str=None):
-    """发送 HTML 账单文件"""
-    gid = update.effective_chat.id
-    if date_str is None:
-        tz_str = get_setting(gid, 'timezone') or 'Asia/Yangon'
-        now, _, _ = get_current_time(tz_str)
-        date_str = now.strftime("%Y-%m-%d")
-    
-    html_content = generate_html_bill(gid, date_str)
-    filename = f"bill_{gid}_{date_str}.html"
-    filepath = os.path.join('/tmp', filename)
-    
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(html_content)
-    
-    with open(filepath, 'rb') as f:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=f,
-            filename=filename,
-            caption=f"📊 账单 {date_str}\n点击文件即可在浏览器中查看"
-        )
-    
-    os.remove(filepath)
-
-# ========== 按钮回调 ==========
+# ========== 机器人命令 ==========
 
 async def show_full_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """查看完整账单（生成HTML文件）"""
+    """发送网页链接"""
     query = update.callback_query
     await query.answer()
-    await send_html_bill(update, context)
-
-async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    
     gid = update.effective_chat.id
-    uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
+    today = datetime.now().strftime("%Y-%m-%d")
     
-    if not can_use(gid, uid):
-        await query.edit_message_text("❌ 你没有权限查看帮助")
-        return
+    # 构建带 group_id 和 date 的链接
+    web_url = f"https://mytelegrambot-rcxg.onrender.com?date={today}&group_id={gid}"
     
-    help_text = """
-📖 *记账机器人帮助*
-
-📌 *记账格式：*
-`+1000` - 入款1000元
-`အမည်+2000` - 带备注入款
-`下发50` - 下发50 USDT
-`+0` - 查看今日汇总
-
-📌 *管理命令：*
-`/mode` - 开启/关闭记账模式
-`/setrate 7.2` - 设置汇率
-`/setoperator` - 设置操作人
-`/bill` - 查看今日账单
-`/history 2026-05-13` - 查询指定日期账单
-`/language` - 切换语言
-`/timezone` - 设置时区
-`/showusdt` - 显示USDT金额
-`/hideusdt` - 隐藏USDT金额
-
-📌 *删除命令：*
-`/deltoday` - 删除今日所有账单
-`/dellast` - 删除最后一笔账单
-`/delall` - 删除所有账单
-`/deluser 名字` - 删除某人的所有账单
-
-📌 *查看账单：*
-点击下方按钮即可生成完整的 HTML 账单文件
-"""
-    
-    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data='back_to_main')]]
-    await query.edit_message_text(help_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(
+        f"📊 *完整账单*\n\n"
+        f"点击链接查看完整账单（可在网页中切换日期）：\n"
+        f"{web_url}\n\n"
+        f"💡 提示：在网页里可以选择任意日期查看账单",
+        parse_mode='Markdown',
+        disable_web_page_preview=False
+    )
 
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -581,7 +592,41 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]]
     await query.edit_message_text(message, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ========== 显示账单函数 ==========
+async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    gid = update.effective_chat.id
+    uid = update.effective_user.id
+    lang = get_setting(gid, 'language') or 'myanmar'
+    
+    if not can_use(gid, uid):
+        await query.edit_message_text("❌ 你没有权限查看帮助")
+        return
+    
+    help_text = """
+📖 *记账机器人帮助*
+
+📌 *记账格式：*
+`+1000` - 入款1000元
+`အမည်+2000` - 带备注入款
+`下发50` - 下发50 USDT
+`+0` - 查看今日汇总
+
+📌 *管理命令：*
+`/mode` - 开启/关闭记账模式
+`/setrate 7.2` - 设置汇率
+`/setoperator` - 设置操作人
+`/bill` - 查看今日账单
+`/language` - 切换语言
+`/timezone` - 设置时区
+
+📌 *删除命令：*
+`/deltoday` - 删除今日所有账单
+`/dellast` - 删除最后一笔账单
+`/delall` - 删除所有账单
+"""
+    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data='back_to_main')]]
+    await query.edit_message_text(help_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_full_bill(update: Update, gid):
     income, expense, total_income, total_expense, today_date = get_today_bills(gid)
@@ -593,10 +638,10 @@ async def show_full_bill(update: Update, gid):
     total_usdt = total_income[1] or 0
     expense_usdt = total_expense[0] or 0
     
-    message = f"📊 {'ယနေ့ငွေစာရင်း' if lang == 'myanmar' else '今日账单汇总'} {today_date}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    message = f"📊 今日账单汇总 {today_date}\n━━━━━━━━━━━━━━━━━━━━\n\n"
     
     if income:
-        message += f"📥 {'ဝင်ငွေ' if lang == 'myanmar' else '入款'}({len(income)} {'ခု' if lang == 'myanmar' else '笔'}):\n"
+        message += f"📥 入款({len(income)} 笔):\n"
         for bill in income[:5]:
             remark, username, amount, usdt, ex_rate, ts = bill
             time_short = ts[11:16] if len(ts) > 11 else ts
@@ -604,42 +649,23 @@ async def show_full_bill(update: Update, gid):
                 if show_usdt:
                     message += f"  {username}【{remark}】{time_short}  {amount:.0f} / {ex_rate:.0f} = {usdt:.2f} U\n"
                 else:
-                    message += f"  {username}【{remark}】{time_short}  {amount:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
+                    message += f"  {username}【{remark}】{time_short}  {amount:.0f} 元\n"
             else:
                 if show_usdt:
                     message += f"  {username} {time_short}  {amount:.0f} / {ex_rate:.0f} = {usdt:.2f} U\n"
                 else:
-                    message += f"  {username} {time_short}  {amount:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        if len(income) > 5:
-            message += f"  ... {len(income)-5} {'ခု' if lang == 'myanmar' else '笔'}\n"
+                    message += f"  {username} {time_short}  {amount:.0f} 元\n"
         message += "\n"
-    else:
-        message += f"📥 {'ဝင်ငွေ' if lang == 'myanmar' else '入款'}(0 {'ခု' if lang == 'myanmar' else '笔'}):\n\n"
     
-    if expense:
-        message += f"📤 {'ထုတ်ငွေ' if lang == 'myanmar' else '下发'}({len(expense)} {'ခု' if lang == 'myanmar' else '笔'}):\n"
-        for bill in expense[:5]:
-            remark, username, usdt, ex_rate, ts = bill
-            time_short = ts[11:16] if len(ts) > 11 else ts
-            if show_usdt:
-                message += f"  {username} {time_short}  {usdt:.2f} U\n"
-            else:
-                message += f"  {username} {time_short}  {usdt * ex_rate:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        if len(expense) > 5:
-            message += f"  ... {len(expense)-5} {'ခု' if lang == 'myanmar' else '笔'}\n"
-        message += "\n"
-    else:
-        message += f"📤 {'ထုတ်ငွေ' if lang == 'myanmar' else '下发'}(0 {'ခု' if lang == 'myanmar' else '笔'}):\n\n"
-    
-    message += f"💰 {'ငွေလဲနှုန်း' if lang == 'myanmar' else '汇率'}：{rate:.2f}\n"
+    message += f"💰 汇率：{rate:.2f}\n"
     if show_usdt:
-        message += f"📊 {'စုစုပေါင်းဝင်ငွေ' if lang == 'myanmar' else '总入款'}：{total_rmb:.0f} | {total_usdt:.2f} U\n"
-        message += f"📊 {'ထုတ်ပြီး' if lang == 'myanmar' else '已下发'}：{expense_usdt:.2f} U\n"
-        message += f"📊 {'ကျန်ငွေ' if lang == 'myanmar' else '未下发'}：{total_usdt - expense_usdt:.2f} U"
+        message += f"📊 总入款：{total_rmb:.0f} | {total_usdt:.2f} U\n"
+        message += f"📊 已下发：{expense_usdt:.2f} U\n"
+        message += f"📊 未下发：{total_usdt - expense_usdt:.2f} U"
     else:
-        message += f"📊 {'စုစုပေါင်းဝင်ငွေ' if lang == 'myanmar' else '总入款'}：{total_rmb:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        message += f"📊 {'ထုတ်ပြီး' if lang == 'myanmar' else '已下发'}：{expense_usdt * rate:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        message += f"📊 {'ကျန်ငွေ' if lang == 'myanmar' else '未下发'}：{(total_usdt - expense_usdt) * rate:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}"
+        message += f"📊 总入款：{total_rmb:.0f} 元\n"
+        message += f"📊 已下发：{expense_usdt * rate:.0f} 元\n"
+        message += f"📊 未下发：{(total_usdt - expense_usdt) * rate:.0f} 元"
     
     keyboard = [[
         InlineKeyboardButton("📊 查看完整账单", callback_data='show_full_report'),
@@ -657,10 +683,10 @@ async def show_today_summary(update: Update, gid):
     total_usdt = total_income[1] or 0
     expense_usdt = total_expense[0] or 0
     
-    message = f"📊 {'ယနေ့ငွေစာရင်း' if lang == 'myanmar' else '今日账单汇总'}\n📅 {today_date}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    message = f"📊 今日账单汇总\n📅 {today_date}\n━━━━━━━━━━━━━━━━━━━━\n\n"
     
     if income:
-        message += f"📥 {'ဝင်ငွေ' if lang == 'myanmar' else '入款'}({len(income)} {'ခု' if lang == 'myanmar' else '笔'}):\n"
+        message += f"📥 入款({len(income)} 笔):\n"
         for bill in income[:5]:
             remark, username, amount, usdt, ex_rate, ts = bill
             time_short = ts[11:16] if len(ts) > 11 else ts
@@ -674,36 +700,17 @@ async def show_today_summary(update: Update, gid):
                     message += f"  {username} {time_short}  +{amount:.0f}元 = {usdt:.2f}U\n"
                 else:
                     message += f"  {username} {time_short}  +{amount:.0f}元\n"
-        if len(income) > 5:
-            message += f"  ... {len(income)-5} {'ခု' if lang == 'myanmar' else '笔'}\n"
         message += "\n"
-    else:
-        message += f"📥 {'ဝင်ငွေ' if lang == 'myanmar' else '入款'}(0 {'ခု' if lang == 'myanmar' else '笔'}):\n\n"
     
-    if expense:
-        message += f"📤 {'ထုတ်ငွေ' if lang == 'myanmar' else '下发'}({len(expense)} {'ခု' if lang == 'myanmar' else '笔'}):\n"
-        for bill in expense[:5]:
-            remark, username, usdt, ex_rate, ts = bill
-            time_short = ts[11:16] if len(ts) > 11 else ts
-            if show_usdt:
-                message += f"  {username} {time_short}  ထုတ် {usdt:.2f}U\n" if lang == 'myanmar' else f"  {username} {time_short}  下发 {usdt:.2f}U\n"
-            else:
-                message += f"  {username} {time_short}  ထုတ် {usdt * ex_rate:.0f}ကျပ်\n" if lang == 'myanmar' else f"  {username} {time_short}  下发 {usdt * ex_rate:.0f}元\n"
-        if len(expense) > 5:
-            message += f"  ... {len(expense)-5} {'ခု' if lang == 'myanmar' else '笔'}\n"
-        message += "\n"
-    else:
-        message += f"📤 {'ထုတ်ငွေ' if lang == 'myanmar' else '下发'}(0 {'ခု' if lang == 'myanmar' else '笔'}):\n\n"
-    
-    message += f"💰 {'ငွေလဲနှုန်း' if lang == 'myanmar' else '汇率'}：{rate:.2f}\n"
+    message += f"💰 汇率：{rate:.2f}\n"
     if show_usdt:
-        message += f"📊 {'စုစုပေါင်းဝင်ငွေ' if lang == 'myanmar' else '总入款'}：{total_rmb:.0f} 元 = {total_usdt:.2f} U\n"
-        message += f"📊 {'ထုတ်ပြီး' if lang == 'myanmar' else '已下发'}：{expense_usdt:.2f} U\n"
-        message += f"📊 {'ကျန်ငွေ' if lang == 'myanmar' else '未下发'}：{total_usdt - expense_usdt:.2f} U"
+        message += f"📊 总入款：{total_rmb:.0f} 元 = {total_usdt:.2f} U\n"
+        message += f"📊 已下发：{expense_usdt:.2f} U\n"
+        message += f"📊 未下发：{total_usdt - expense_usdt:.2f} U"
     else:
-        message += f"📊 {'စုစုပေါင်းဝင်ငွေ' if lang == 'myanmar' else '总入款'}：{total_rmb:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        message += f"📊 {'ထုတ်ပြီး' if lang == 'myanmar' else '已下发'}：{expense_usdt * rate:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        message += f"📊 {'ကျန်ငွေ' if lang == 'myanmar' else '未下发'}：{(total_usdt - expense_usdt) * rate:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}"
+        message += f"📊 总入款：{total_rmb:.0f} 元\n"
+        message += f"📊 已下发：{expense_usdt * rate:.0f} 元\n"
+        message += f"📊 未下发：{(total_usdt - expense_usdt) * rate:.0f} 元"
     
     keyboard = [[
         InlineKeyboardButton("📊 查看完整账单", callback_data='show_full_report'),
@@ -717,54 +724,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     rate = get_setting(gid, 'exchange_rate') or 7.2
     is_active = get_setting(gid, 'is_active') or 0
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     status = "🟢 开启" if is_active else "🔴 关闭"
-    if lang == 'myanmar':
-        message = f"🤖 *ငွေစာရင်းဘော့စတင်ပြီး*\n\n📌 အခြေအနေ: {status}\n💰 ငွေလဲနှုန်း: 1 USDT = {rate:.2f} ကျပ်\n\nအကူအညီရယူရန် /help ကိုနှိပ်ပါ"
-    else:
-        message = f"🤖 *记账机器人已启动*\n\n📌 状态: {status}\n💰 汇率: 1 USDT = {rate:.2f} 元\n\n发送 /help 查看帮助"
+    message = f"🤖 *记账机器人已启动*\n\n📌 状态: {status}\n💰 汇率: 1 USDT = {rate:.2f} 元\n\n发送 /help 查看帮助"
     
     await update.message.reply_text(message, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = update.effective_chat.id
-    lang = get_setting(gid, 'language') or 'myanmar'
-    
-    if lang == 'myanmar':
-        help_text = """
-🤖 *ငွေစာရင်းဘော့အကူအညီ*
-
-📌 *ငွေစာရင်းသွင်းနည်း：*
-`+1000` - ၁၀၀၀ ကျပ်သွင်းရန်
-`အမည်+2000` - မှတ်ချက်ထည့်သွင်းရန်
-`ထုတ်50` - USDT 50 ထုတ်ရန်
-`+0` - ယနေ့အကျဉ်းချုပ်ကြည့်ရန်
-`/history 2026-05-13` - ရက်စွဲအလိုက်ရှာဖွေရန်
-
-📌 *စီမံခန့်ခွဲမှု：*
-`/mode` - ငွေစာရင်းမုဒ်ဖွင့်/ပိတ်
-`/setrate 7.2` - ငွေလဲနှုန်းသတ်မှတ်
-`/setoperator` - အသုံးပြုသူသတ်မှတ်
-`/bill` - ယနေ့ငွေစာရင်းကြည့်ရန်
-`/language` - ဘာသာစကားပြောင်းရန်
-`/timezone` - အချိန်ဇုန်ပြောင်းရန်
-
-📌 *ဖျက်ခြင်း：*
-`/deltoday` - ယနေ့ငွေစာရင်းဖျက်
-`/dellast` - နောက်ဆုံးငွေစာရင်းဖျက်
-`/delall` - ငွေစာရင်းအားလုံးဖျက်
-"""
-    else:
-        help_text = """
+    help_text = """
 🤖 *记账机器人帮助*
 
 📌 *记账格式：*
 `+1000` - 入款1000元
-`အမည်+2000` - 带备注入款
-`下发50` - 下发50 USDT
+`အမည်+2000` - 带备注入款`下发50` - 下发50 USDT
 `+0` - 查看今日汇总
-`/history 2026-05-13` - 查询指定日期账单
 
 📌 *管理命令：*
 `/mode` - 开启/关闭记账模式
@@ -784,27 +757,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     current = get_setting(gid, 'is_active') or 0
     if current == 0:
         update_setting(gid, 'is_active', 1)
-        await update.message.reply_text("✅ စာရင်းသွင်းမုဒ် ဖွင့်ပြီး\n\nငွေစာရင်းသွင်းနိုင်ပါပြီ။" if lang == 'myanmar' else "✅ 记账模式已开启\n\n现在可以发送记账命令了！")
+        await update.message.reply_text("✅ 记账模式已开启\n\n现在可以发送记账命令了！")
     else:
         update_setting(gid, 'is_active', 0)
-        await update.message.reply_text("🔕 စာရင်းသွင်းမုဒ် ပိတ်ပြီး" if lang == 'myanmar' else "🔕 记账模式已关闭")
+        await update.message.reply_text("🔕 记账模式已关闭")
 
 async def setrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     if not context.args:
@@ -814,130 +785,34 @@ async def setrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         rate = float(context.args[0])
         update_setting(gid, 'exchange_rate', rate)
-        await update.message.reply_text(f"✅ ငွေလဲနှုန်းသတ်မှတ်ပြီး {rate}" if lang == 'myanmar' else f"✅ 汇率已设为 {rate}")
+        await update.message.reply_text(f"✅ 汇率已设为 {rate}")
     except:
-        await update.message.reply_text("❌ ကျေးဇူးပြု၍ ငွေလဲနှုန်းမှန်ကန်စွာထည့်ပါ" if lang == 'myanmar' else "❌ 请输入正确的数字")
+        await update.message.reply_text("❌ 请输入正确的数字")
 
 async def bill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     await show_today_summary(update, gid)
 
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = update.effective_chat.id
-    uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
-    
-    if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("📅 သုံးစွဲပုံ: /history 2026-05-13\n\nဥပမာ: /history 2026-05-13" if lang == 'myanmar' else "📅 用法: /history 2026-05-13\n\n例如: /history 2026-05-13")
-        return
-    
-    date_str = context.args[0]
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-    except:
-        await update.message.reply_text("❌ ရက်စွဲပုံစံမှားယွင်းနေပါသည်။\nမှန်ကန်သောပုံစံ: 2026-05-13" if lang == 'myanmar' else "❌ 日期格式错误！\n正确格式: 2026-05-13")
-        return
-    
-    bills, total_income, total_expense = get_bills_by_date(gid, date_str)
-    rate = get_setting(gid, 'exchange_rate') or 7.2
-    show_usdt = get_setting(gid, 'show_usdt') or 1
-    
-    total_rmb = total_income[0] or 0
-    total_usdt = total_income[1] or 0
-    expense_usdt = total_expense[0] or 0
-    
-    if not bills:
-        await update.message.reply_text(f"📭 {date_str} {'ငွေစာရင်းမရှိပါ' if lang == 'myanmar' else '没有账单记录'}")
-        return
-    
-    message = f"📊 *{'သမိုင်းစာရင်း' if lang == 'myanmar' else '历史账单'}*\n📅 {date_str}\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    income_bills = [b for b in bills if b[5] == 'income']
-    expense_bills = [b for b in bills if b[5] == 'expense']
-    
-    if income_bills:
-        message += f"📥 {'ဝင်ငွေ' if lang == 'myanmar' else '入款'}({len(income_bills)} {'ခု' if lang == 'myanmar' else '笔'}):\n"
-        for bill in income_bills[:10]:
-            remark, username, amount, usdt, ex_rate, _, ts = bill
-            time_short = ts[11:16] if len(ts) > 11 else ts
-            if remark:
-                if show_usdt:
-                    message += f"  {username}【{remark}】{time_short}  {amount:.0f} / {ex_rate:.0f} = {usdt:.2f} U\n"
-                else:
-                    message += f"  {username}【{remark}】{time_short}  {amount:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-            else:
-                if show_usdt:
-                    message += f"  {username} {time_short}  {amount:.0f} / {ex_rate:.0f} = {usdt:.2f} U\n"
-                else:
-                    message += f"  {username} {time_short}  {amount:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        if len(income_bills) > 10:
-            message += f"  ... {len(income_bills)-10} {'ခု' if lang == 'myanmar' else '笔'}\n"
-        message += "\n"
-    
-    if expense_bills:
-        message += f"📤 {'ထုတ်ငွေ' if lang == 'myanmar' else '下发'}({len(expense_bills)} {'ခု' if lang == 'myanmar' else '笔'}):\n"
-        for bill in expense_bills[:10]:
-            remark, username, amount, usdt, ex_rate, _, ts = bill
-            time_short = ts[11:16] if len(ts) > 11 else ts
-            if show_usdt:
-                message += f"  {username} {time_short}  {usdt:.2f} U\n"
-            else:
-                message += f"  {username} {time_short}  {usdt * ex_rate:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        if len(expense_bills) > 10:
-            message += f"  ... {len(expense_bills)-10} {'ခု' if lang == 'myanmar' else '笔'}\n"
-        message += "\n"
-    
-    message += "━━━━━━━━━━━━━━━━━━━━\n"
-    message += f"💰 {'ငွေလဲနှုန်း' if lang == 'myanmar' else '汇率'}：{rate:.2f}\n"
-    if show_usdt:
-        message += f"📊 {'စုစုပေါင်းဝင်ငွေ' if lang == 'myanmar' else '总入款'}：{total_rmb:.0f} | {total_usdt:.2f} U\n"
-        message += f"📊 {'ထုတ်ပြီး' if lang == 'myanmar' else '已下发'}：{expense_usdt:.2f} U\n"
-        message += f"📊 {'ကျန်ငွေ' if lang == 'myanmar' else '未下发'}：{total_usdt - expense_usdt:.2f} U"
-    else:
-        message += f"📊 {'စုစုပေါင်းဝင်ငွေ' if lang == 'myanmar' else '总入款'}：{total_rmb:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        message += f"📊 {'ထုတ်ပြီး' if lang == 'myanmar' else '已下发'}：{expense_usdt * rate:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}\n"
-        message += f"📊 {'ကျန်ငွေ' if lang == 'myanmar' else '未下发'}：{(total_usdt - expense_usdt) * rate:.0f} {'ကျပ်' if lang == 'myanmar' else '元'}"
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
-
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     rate = get_setting(gid, 'exchange_rate') or 7.2
     is_active = get_setting(gid, 'is_active') or 0
-    lang = get_setting(gid, 'language') or 'myanmar'
-    tz_str = get_setting(gid, 'timezone') or 'Asia/Yangon'
-    show_usdt = get_setting(gid, 'show_usdt') or 1
     ops = json.loads(get_setting(gid, 'operators') or '[]')
     
-    status = "ဖွင့်" if is_active else "ပိတ်" if lang == 'myanmar' else "开启" if is_active else "关闭"
-    timezone_name = "မြန်မာ" if tz_str == 'Asia/Yangon' else "တရုတ်" if tz_str == 'Asia/Shanghai' else "ထိုင်း" if lang == 'myanmar' else "缅甸" if tz_str == 'Asia/Yangon' else "中国" if tz_str == 'Asia/Shanghai' else "泰国"
-    language_name = "မြန်မာ" if lang == 'myanmar' else "中文"
-    usdt_status = "ပြ" if show_usdt else "ဝှက်" if lang == 'myanmar' else "显示" if show_usdt else "隐藏"
-    
-    message = f"⚙️ *{'ပြင်ဆင်ချက်များ' if lang == 'myanmar' else '当前设置'}*\n"
-    message += f"💰 {'ငွေလဲနှုန်း' if lang == 'myanmar' else '汇率'}: {rate}\n"
-    message += f"🔘 {'မုဒ်' if lang == 'myanmar' else '模式'}: {status}\n"
-    message += f"🌍 {'အချိန်ဇုန်' if lang == 'myanmar' else '时区'}: {timezone_name}\n"
-    message += f"📖 {'ဘာသာစကား' if lang == 'myanmar' else '语言'}: {language_name}\n"
-    message += f"💵 USDT{'ပြသမှု' if lang == 'myanmar' else '显示'}: {usdt_status}\n"
-    message += f"👤 {'အသုံးပြုသူ' if lang == 'myanmar' else '操作人'}: {len(ops)} {'ဦး' if lang == 'myanmar' else '人'}"
+    status = "开启" if is_active else "关闭"
+    message = f"⚙️ *当前设置*\n💰 汇率: {rate}\n🔘 模式: {status}\n👤 操作人: {len(ops)}人"
     await update.message.reply_text(message, parse_mode='Markdown')
 
 async def setoperator_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     gid = update.effective_chat.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not is_master(uid):
-        await update.message.reply_text("❌ ဘော့ပိုင်ရှင်သာ အသုံးပြုသူသတ်မှတ်နိုင်သည်။" if lang == 'myanmar' else "❌ 只有机器人主人可以设置操作人")
+        await update.message.reply_text("❌ 只有机器人主人可以设置操作人")
         return
     
     if not update.message.reply_to_message:
-        await update.message.reply_text("❌ အသုံးပြုသူသတ်မှတ်ရန် စာကိုပြန်ကြားပေးပါ။" if lang == 'myanmar' else "❌ 请回复要设置为操作人的消息")
+        await update.message.reply_text("❌ 请回复要设置为操作人的消息")
         return
     
     target = update.message.reply_to_message.from_user
@@ -945,20 +820,19 @@ async def setoperator_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if target.id not in ops:
         ops.append(target.id)
         update_setting(gid, 'operators', json.dumps(ops))
-        await update.message.reply_text(f"✅ {target.first_name} ကို အသုံးပြုသူအဖြစ်သတ်မှတ်ပြီး" if lang == 'myanmar' else f"✅ 已设置 {target.first_name} 为操作人")
+        await update.message.reply_text(f"✅ 已设置 {target.first_name} 为操作人")
     else:
-        await update.message.reply_text("ဤအသုံးပြုသူသည် အသုံးပြုသူဖြစ်နေပြီး" if lang == 'myanmar' else "该用户已经是操作人")
+        await update.message.reply_text("该用户已经是操作人")
 
 async def listops_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     ops = json.loads(get_setting(gid, 'operators') or '[]')
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not ops:
-        await update.message.reply_text("📋 အသုံးပြုသူမရှိသေးပါ" if lang == 'myanmar' else "📋 暂无操作人")
+        await update.message.reply_text("📋 暂无操作人")
         return
     
-    message = "📋 အသုံးပြုသူစာရင်း:\n" if lang == 'myanmar' else "📋 操作人列表:\n"
+    message = "📋 操作人列表:\n"
     for oid in ops:
         try:
             member = await context.bot.get_chat_member(gid, oid)
@@ -978,15 +852,14 @@ async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = get_setting(gid, 'language') or 'myanmar'
     new_lang = 'chinese' if current == 'myanmar' else 'myanmar'
     update_setting(gid, 'language', new_lang)
-    await update.message.reply_text("✅ ဘာသာစကားပြောင်းပြီး\n✅ 语言已切换")
+    await update.message.reply_text("✅ 语言已切换")
 
 async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     if not context.args:
@@ -997,86 +870,143 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz_name = context.args[0].lower()
     if tz_name in TIMEZONES:
         update_setting(gid, 'timezone', TIMEZONES[tz_name])
-        await update.message.reply_text("✅ အချိန်ဇုန်ပြောင်းပြီး\n✅ 时区已切换" if lang == 'myanmar' else "✅ 时区已切换\n✅ အချိန်ဇုန်ပြောင်းပြီး")
+        await update.message.reply_text("✅ 时区已切换")
     else:
         await update.message.reply_text("❌ 无效的时区\n可用: china, myanmar, thailand")
 
 async def show_usdt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     update_setting(gid, 'show_usdt', 1)
-    await update.message.reply_text("✅ USDT ပြသမှုဖွင့်ပြီး" if lang == 'myanmar' else "✅ 已开启USDT显示模式")
+    await update.message.reply_text("✅ 已开启USDT显示模式")
 
 async def hide_usdt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     update_setting(gid, 'show_usdt', 0)
-    await update.message.reply_text("🔕 USDT ပြသမှုပိတ်ပြီး" if lang == 'myanmar' else "🔕 已关闭USDT显示模式")
+    await update.message.reply_text("🔕 已关闭USDT显示模式")
 
 async def del_today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     deleted = delete_today_bills(gid)
-    await update.message.reply_text(f"✅ ယနေ့ငွေစာရင်း {deleted} ခုကိုဖျက်ပြီး" if deleted > 0 else "📭 ယနေ့ငွေစာရင်းမရှိပါ" if lang == 'myanmar' else f"✅ 已删除今日所有账单，共 {deleted} 条记录" if deleted > 0 else "📭 今日暂无账单可删除")
+    await update.message.reply_text(f"✅ 已删除今日所有账单，共 {deleted} 条记录" if deleted > 0 else "📭 今日暂无账单可删除")
 
 async def del_last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     deleted = delete_last_bill(gid)
-    await update.message.reply_text("✅ နောက်ဆုံးငွေစာရင်းကိုဖျက်ပြီး" if deleted > 0 else "📭 ငွေစာရင်းမရှိပါ" if lang == 'myanmar' else "✅ 已删除最后一笔账单" if deleted > 0 else "📭 暂无账单可删除")
+    await update.message.reply_text("✅ 已删除最后一笔账单" if deleted > 0 else "📭 暂无账单可删除")
 
 async def del_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     deleted = delete_all_bills(gid)
-    await update.message.reply_text(f"✅ ငွေစာရင်းအားလုံး {deleted} ခုကိုဖျက်ပြီး" if deleted > 0 else "📭 ငွေစာရင်းမရှိပါ" if lang == 'myanmar' else f"✅ 已删除所有账单，共 {deleted} 条记录" if deleted > 0 else "📭 暂无账单可删除")
+    await update.message.reply_text(f"✅ 已删除所有账单，共 {deleted} 条记录" if deleted > 0 else "📭 暂无账单可删除")
 
 async def del_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     uid = update.effective_user.id
-    lang = get_setting(gid, 'language') or 'myanmar'
     
     if not can_use(gid, uid):
-        await update.message.reply_text("❌ သင့်တွင်အသုံးပြုခွင့်မရှိပါ" if lang == 'myanmar' else "❌ 你没有操作权限")
+        await update.message.reply_text("❌ 你没有操作权限")
         return
     
     if not context.args:
-        await update.message.reply_text("အသုံးပြုပုံ: /deluser အမည်" if lang == 'myanmar' else "用法: /deluser 名字")
+        await update.message.reply_text("用法: /deluser 名字")
         return
     
     target_name = ' '.join(context.args)
     deleted = delete_user_bills(gid, target_name)
-    await update.message.reply_text(f"✅ {target_name} ၏ငွေစာရင်း {deleted} ခုကိုဖျက်ပြီး" if lang == 'myanmar' else f"✅ 已删除 {target_name} 的账单，共 {deleted} 条记录")
+    await update.message.reply_text(f"✅ 已删除 {target_name} 的账单，共 {deleted} 条记录")
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gid = update.effective_chat.id
+    uid = update.effective_user.id
+    
+    if not can_use(gid, uid):
+        await update.message.reply_text("❌ 你没有操作权限")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("📅 用法: /history 2026-05-13\n\n例如: /history 2026-05-13")
+        return
+    
+    date_str = context.args[0]
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except:
+        await update.message.reply_text("❌ 日期格式错误！\n正确格式: 2026-05-13")
+        return
+    
+    bills, total_income, total_expense = get_bills_by_date(gid, date_str)
+    rate = get_setting(gid, 'exchange_rate') or 7.2
+    show_usdt = get_setting(gid, 'show_usdt') or 1
+    
+    total_rmb = total_income[0] or 0
+    total_usdt = total_income[1] or 0
+    expense_usdt = total_expense[0] or 0
+    
+    if not bills:
+        await update.message.reply_text(f"📭 {date_str} 没有账单记录")
+        return
+    
+    message = f"📊 *历史账单*\n📅 {date_str}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    income_bills = [b for b in bills if b[5] == 'income']
+    if income_bills:
+        message += f"📥 入款({len(income_bills)} 笔):\n"
+        for bill in income_bills[:10]:
+            remark, username, amount, usdt, ex_rate, _, ts = bill
+            time_short = ts[11:16] if len(ts) > 11 else ts
+            if remark:
+                if show_usdt:
+                    message += f"  {username}【{remark}】{time_short}  {amount:.0f} / {ex_rate:.0f} = {usdt:.2f} U\n"
+                else:
+                    message += f"  {username}【{remark}】{time_short}  {amount:.0f} 元\n"
+            else:
+                if show_usdt:
+                    message += f"  {username} {time_short}  {amount:.0f} / {ex_rate:.0f} = {usdt:.2f} U\n"
+                else:
+                    message += f"  {username} {time_short}  {amount:.0f} 元\n"
+        message += "\n"
+    
+    message += f"💰 汇率：{rate:.2f}\n"
+    if show_usdt:
+        message += f"📊 总入款：{total_rmb:.0f} | {total_usdt:.2f} U\n"
+        message += f"📊 已下发：{expense_usdt:.2f} U\n"
+        message += f"📊 未下发：{total_usdt - expense_usdt:.2f} U"
+    else:
+        message += f"📊 总入款：{total_rmb:.0f} 元\n"
+        message += f"📊 已下发：{expense_usdt * rate:.0f} 元\n"
+        message += f"📊 未下发：{(total_usdt - expense_usdt) * rate:.0f} 元"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
 
 async def accounting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -1112,10 +1042,20 @@ async def accounting(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_full_bill(update, gid)
         return
 
+def run_web():
+    """启动 Flask Web 服务器"""
+    flask_app.run(host='0.0.0.0', port=PORT)
+
 def main():
     init_db()
     print("🤖 机器人启动中...")
+    print(f"🌐 Web 服务启动在端口 {PORT}...")
     
+    # 启动 Web 服务器线程
+    web_thread = threading.Thread(target=run_web, daemon=True)
+    web_thread.start()
+    
+    # 启动 Telegram 机器人
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
@@ -1143,6 +1083,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, accounting))
     
     print("✅ 机器人运行中...")
+    print(f"📊 网页访问地址: https://my-telegrambot-u11.onrender.com")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
